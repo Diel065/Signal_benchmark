@@ -9,11 +9,10 @@ use axum::{
 };
 
 use signal_playground::client::Client;
-use signal_playground::worker_api::{handle_command, Command, CommandResponse, PendingIntent};
+use signal_playground::worker_api::{handle_command, Command, CommandResponse};
 
 struct WorkerState {
     client: Client,
-    queued_intent: Option<PendingIntent>,
     key_repository_url: String,
     relay_url: String,
 }
@@ -84,18 +83,11 @@ async fn run_command(
 
         let WorkerState {
             client,
-            queued_intent,
             key_repository_url: _,
             relay_url: _,
         } = &mut *guard;
 
-        match handle_command(
-            client,
-            &key_repository_url,
-            &relay_url,
-            queued_intent,
-            command,
-        ) {
+        match handle_command(client, &key_repository_url, &relay_url, command) {
             Ok(message) => CommandResponse::ok(message),
             Err(err) => CommandResponse::error(err.to_string()),
         }
@@ -117,7 +109,6 @@ async fn main() -> Result<()> {
 
     let state: SharedWorkerState = Arc::new(Mutex::new(WorkerState {
         client: Client::new(&name)?,
-        queued_intent: None,
         key_repository_url: key_repository_url.clone(),
         relay_url: relay_url.clone(),
     }));

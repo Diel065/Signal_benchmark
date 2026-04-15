@@ -1,22 +1,25 @@
 use anyhow::{anyhow, Result};
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, CommitReceiveOutcome, EpochChangeOutput};
+use crate::{
+    client::Client,
+    profiling::{finish_and_emit, ProfileScope},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    CreateGroup,
     GeneratePreKeyBundle,
-    AddMembers { members: Vec<String> },
-    JoinFromGroupInvite,
-    SendApplicationMessage { message: String },
-    ReceiveApplicationMessage { profile: bool },
-    SelfUpdate,
-    RemoveMembers { members: Vec<String> },
-    ReceiveGroupChange,
-    ShowGroupState,
+    SendFanoutMessage {
+        recipients: Vec<String>,
+        message: String,
+    },
+    ReceivePairwiseMessage {
+        profile: bool,
+    },
+    SessionExists {
+        peer: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,84 +44,17 @@ impl CommandResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct GroupStatePutRequest {
-    members: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub enum PendingIntent {
-    AddMembers {
-        members: Vec<String>,
-        new_member_pre_key_bundles: Vec<Vec<u8>>,
-        recipient_pre_key_bundles: Vec<(String, Vec<u8>)>,
-    },
-    RemoveMembers {
-        members: Vec<String>,
-        recipient_pre_key_bundles: Vec<(String, Vec<u8>)>,
-    },
-    SelfUpdate {
-        recipient_pre_key_bundles: Vec<(String, Vec<u8>)>,
-    },
-}
-
-pub enum KeyRepositoryPostResult {
-    Ok,
-    Conflict(String),
-}
-
-pub fn key_repo_post_bytes_allow_conflict(
-    key_repository_url: &str,
-    path: &str,
-    bytes: Vec<u8>,
-) -> Result<KeyRepositoryPostResult> {
+pub fn key_repo_post_bytes(key_repository_url: &str, path: &str, bytes: Vec<u8>) -> Result<()> {
     let url = format!("{key_repository_url}{path}");
 
     let client = reqwest::blocking::Client::new();
     let response = client.post(url).body(bytes).send()?;
 
-    if response.status().is_success() {
-        return Ok(KeyRepositoryPostResult::Ok);
-    }
-
-    if response.status() == StatusCode::CONFLICT {
-        let body = response.text().unwrap_or_default();
-        return Ok(KeyRepositoryPostResult::Conflict(body));
-    }
-
-    let status = response.status();
-    let body = response.text().unwrap_or_default();
-    Err(anyhow!(
-        "Key repository POST failed with status {}: {}",
-        status,
-        body
-    ))
-}
-
-pub fn key_repo_post_bytes(key_repository_url: &str, path: &str, bytes: Vec<u8>) -> Result<()> {
-    match key_repo_post_bytes_allow_conflict(key_repository_url, path, bytes)? {
-        KeyRepositoryPostResult::Ok => Ok(()),
-        KeyRepositoryPostResult::Conflict(message) => {
-            Err(anyhow!("Unexpected key repository conflict: {}", message))
-        }
-    }
-}
-
-pub fn key_repo_put_json<T: Serialize>(
-    key_repository_url: &str,
-    path: &str,
-    body: &T,
-) -> Result<()> {
-    let url = format!("{key_repository_url}{path}");
-
-    let client = reqwest::blocking::Client::new();
-    let response = client.put(url).json(body).send()?;
-
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
         return Err(anyhow!(
-            "Key repository PUT failed with status {}: {}",
+            "Key repository POST failed with status {}: {}",
             status,
             body
         ));
@@ -128,6 +64,39 @@ pub fn key_repo_put_json<T: Serialize>(
 }
 
 pub fn key_repo_get_bytes(key_repository_url: &str, path: &str) -> Result<Vec<u8>> {
+    let fetched = key_repo_get_pre_key_bundle(key_repository_url, path)?;
+    Ok(fetched.bytes)
+}
+
+struct FetchedPreKeyBundle {
+    bytes: Vec<u8>,
+    opk_present: bool,
+    opk_consumed: bool,
+}
+
+fn parse_bool_header(response: &reqwest::blocking::Response, header_name: &str) -> Result<bool> {
+    let raw = response
+        .headers()
+        .get(header_name)
+        .ok_or_else(|| anyhow!("Missing response header {}", header_name))?;
+    let raw = raw
+        .to_str()
+        .map_err(|err| anyhow!("Invalid response header {}: {}", header_name, err))?;
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(anyhow!(
+            "Unexpected response header {} value {}",
+            header_name,
+            other
+        )),
+    }
+}
+
+fn key_repo_get_pre_key_bundle(
+    key_repository_url: &str,
+    path: &str,
+) -> Result<FetchedPreKeyBundle> {
     let url = format!("{key_repository_url}{path}");
 
     let response = reqwest::blocking::get(url)?;
@@ -139,31 +108,18 @@ pub fn key_repo_get_bytes(key_repository_url: &str, path: &str) -> Result<Vec<u8
         ));
     }
 
-    Ok(response.bytes()?.to_vec())
+    Ok(FetchedPreKeyBundle {
+        opk_present: parse_bool_header(&response, "x-signal-opk-present")?,
+        opk_consumed: parse_bool_header(&response, "x-signal-opk-consumed")?,
+        bytes: response.bytes()?.to_vec(),
+    })
 }
 
-pub fn relay_post_application_message(
-    relay_url: &str,
-    group_id: &str,
-    sender: &str,
-    recipients: &[String],
-    bytes: Vec<u8>,
-) -> Result<()> {
-    let url = format!(
-        "{}/group/{}/application-message/{}",
-        relay_url.trim_end_matches('/'),
-        group_id,
-        sender
-    );
-
-    let recipients_header = recipients.join(",");
+pub fn relay_post_message(relay_url: &str, recipient: &str, bytes: Vec<u8>) -> Result<()> {
+    let url = format!("{}/message/{}", relay_url.trim_end_matches('/'), recipient);
 
     let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(url)
-        .header("x-recipients", recipients_header)
-        .body(bytes)
-        .send()?;
+    let response = client.post(url).body(bytes).send()?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -178,12 +134,8 @@ pub fn relay_post_application_message(
     Ok(())
 }
 
-pub fn relay_get_application_message(relay_url: &str, recipient: &str) -> Result<Vec<u8>> {
-    let url = format!(
-        "{}/application-message/{}",
-        relay_url.trim_end_matches('/'),
-        recipient
-    );
+pub fn relay_get_message(relay_url: &str, recipient: &str) -> Result<Vec<u8>> {
+    let url = format!("{}/message/{}", relay_url.trim_end_matches('/'), recipient);
 
     let response = reqwest::blocking::get(url)?;
 
@@ -197,119 +149,45 @@ pub fn relay_get_application_message(relay_url: &str, recipient: &str) -> Result
     Ok(response.bytes()?.to_vec())
 }
 
-pub fn update_key_repository_group_state(client: &Client, key_repository_url: &str) -> Result<()> {
-    let group_id = client.group_id_hex()?;
-    let epoch = client.current_epoch_u64()?;
-    let members = client.member_names()?;
-
-    let path = format!("/group/{group_id}/state/{epoch}");
-    let body = GroupStatePutRequest { members };
-
-    key_repo_put_json(key_repository_url, &path, &body)
-}
-
-pub fn publish_epoch_change(
-    client: &mut Client,
+fn fetch_missing_pre_key_bundles(
+    client: &Client,
     key_repository_url: &str,
-    result: EpochChangeOutput,
-) -> Result<KeyRepositoryPostResult> {
-    let group_id = client.group_id_hex()?;
-    let epoch = client.current_epoch_u64()?;
-    let path = format!("/group/{group_id}/change/{}/{epoch}", client.name);
-
-    key_repo_post_bytes_allow_conflict(key_repository_url, &path, result.commit_bytes)
-}
-
-pub fn try_start_intent(
-    client: &mut Client,
-    key_repository_url: &str,
-    intent: &PendingIntent,
-) -> Result<KeyRepositoryPostResult> {
-    let result = match intent {
-        PendingIntent::AddMembers {
-            members,
-            new_member_pre_key_bundles,
-            recipient_pre_key_bundles,
-        } => client.add_members(
-            new_member_pre_key_bundles,
-            members,
-            recipient_pre_key_bundles,
-        )?,
-        PendingIntent::RemoveMembers {
-            members,
-            recipient_pre_key_bundles,
-        } => client.remove_members(members, recipient_pre_key_bundles)?,
-        PendingIntent::SelfUpdate {
-            recipient_pre_key_bundles,
-        } => client.self_update(recipient_pre_key_bundles)?,
-    };
-
-    match publish_epoch_change(client, key_repository_url, result)? {
-        KeyRepositoryPostResult::Ok => Ok(KeyRepositoryPostResult::Ok),
-        KeyRepositoryPostResult::Conflict(message) => {
-            client.rollback_pending_commit()?;
-            Ok(KeyRepositoryPostResult::Conflict(message))
+    peers: &[String],
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut bundles = Vec::new();
+    for peer in peers {
+        if client.session_exists(peer)? {
+            continue;
         }
+        let path = format!("/pre-key-bundle/{peer}");
+        let scope = ProfileScope::start("fetch_prekey_bundle", "key-repository-http");
+        let fetched = key_repo_get_pre_key_bundle(key_repository_url, &path)?;
+        let fetched_bytes = fetched.bytes.len();
+        finish_and_emit(scope, |event| {
+            event.protocol_bytes = Some(fetched_bytes);
+            event.wire_bytes = Some(fetched_bytes);
+            event.harness_metadata_bytes = Some(0);
+            event.ciphertext_count = Some(0);
+            event.recipient_count = Some(1);
+            event.fanout_recipients = Some(1);
+            event.session_setup_count = Some(0);
+            event.payload_class = Some("prekey_bundle_fetch".to_string());
+            event.pre_key_bundle_fetch_bytes = Some(fetched_bytes);
+            event.opk_present_count = Some(usize::from(fetched.opk_present));
+            event.opk_consumed_count = Some(usize::from(fetched.opk_consumed));
+        });
+        bundles.push((peer.clone(), fetched.bytes));
     }
-}
-
-pub fn maybe_retry_pending_intent(
-    client: &mut Client,
-    key_repository_url: &str,
-    queued_intent: &mut Option<PendingIntent>,
-) -> Result<Option<String>> {
-    let Some(intent) = queued_intent.clone() else {
-        return Ok(None);
-    };
-
-    match try_start_intent(client, key_repository_url, &intent)? {
-        KeyRepositoryPostResult::Ok => {
-            *queued_intent = None;
-
-            let text = match intent {
-                PendingIntent::AddMembers { members, .. } => {
-                    format!(
-                        "queued add_members for {:?} was retried and published",
-                        members
-                    )
-                }
-                PendingIntent::RemoveMembers { members, .. } => {
-                    format!(
-                        "queued remove_members for {:?} was retried and published",
-                        members
-                    )
-                }
-                PendingIntent::SelfUpdate { .. } => {
-                    "queued self_update was retried and published".to_string()
-                }
-            };
-
-            Ok(Some(text))
-        }
-        KeyRepositoryPostResult::Conflict(message) => {
-            *queued_intent = Some(intent);
-            Ok(Some(format!(
-                "queued intent retry still conflicted and remains queued: {}",
-                message
-            )))
-        }
-    }
+    Ok(bundles)
 }
 
 pub fn handle_command(
     client: &mut Client,
     key_repository_url: &str,
     relay_url: &str,
-    queued_intent: &mut Option<PendingIntent>,
     command: Command,
 ) -> Result<String> {
     match command {
-        Command::CreateGroup => {
-            client.create_group()?;
-            update_key_repository_group_state(client, key_repository_url)?;
-            Ok("Signal group created and key repository group state registered".to_string())
-        }
-
         Command::GeneratePreKeyBundle => {
             let pre_key_bundle_bytes = client.generate_pre_key_bundle()?;
             let path = format!("/pre-key-bundle/{}", client.name);
@@ -317,206 +195,43 @@ pub fn handle_command(
             Ok(format!("pre-key bundle uploaded for {}", client.name))
         }
 
-        Command::AddMembers { members } => {
-            let mut new_member_pre_key_bundles = Vec::with_capacity(members.len());
-            for member in &members {
-                let path = format!("/pre-key-bundle/{member}");
-                new_member_pre_key_bundles.push(key_repo_get_bytes(key_repository_url, &path)?);
+        Command::SendFanoutMessage {
+            recipients,
+            message,
+        } => {
+            if recipients.is_empty() {
+                return Err(anyhow!("SendFanoutMessage requires at least one recipient"));
             }
 
-            let existing_recipients: Vec<String> = client
-                .member_names()?
-                .into_iter()
-                .filter(|member| member != &client.name)
-                .collect();
             let recipient_pre_key_bundles =
-                fetch_pre_key_bundles(key_repository_url, &existing_recipients)?;
-
-            let intent = PendingIntent::AddMembers {
-                members: members.clone(),
-                new_member_pre_key_bundles,
-                recipient_pre_key_bundles,
-            };
-
-            match try_start_intent(client, key_repository_url, &intent)? {
-                KeyRepositoryPostResult::Ok => Ok(format!(
-                    "Signal members {:?} added locally with pairwise group-control messages; change published, waiting for key repository echo",
-                    members
-                )),
-                KeyRepositoryPostResult::Conflict(message) => {
-                    *queued_intent = Some(intent);
-                    Ok(format!(
-                        "add_members for {:?} lost the epoch race and was queued for retry: {}",
-                        members, message
-                    ))
-                }
-            }
-        }
-
-        Command::JoinFromGroupInvite => {
-            let invite_path = format!("/group-invite/{}", client.name);
-            let invite_bytes = key_repo_get_bytes(key_repository_url, &invite_path)?;
-
-            client.join_from_group_invite(&invite_bytes)?;
-
-            Ok(format!("{} joined from Signal group invite", client.name))
-        }
-
-        Command::SendApplicationMessage { message } => {
-            let sender = client.name.clone();
-            let mut recipients = client.member_names()?;
-            recipients.retain(|recipient| recipient != &sender);
-
-            let recipient_pre_key_bundles = fetch_pre_key_bundles(key_repository_url, &recipients)?;
-            let message_bytes =
-                client.send_application_message(message.as_bytes(), &recipient_pre_key_bundles)?;
-            let group_id = client.group_id_hex()?;
-
-            relay_post_application_message(
-                relay_url,
-                &group_id,
-                &sender,
+                fetch_missing_pre_key_bundles(client, key_repository_url, &recipients)?;
+            let messages = client.send_application_message(
+                message.as_bytes(),
                 &recipients,
-                message_bytes,
+                &recipient_pre_key_bundles,
             )?;
 
-            Ok("pairwise Signal application message broadcast to group".to_string())
-        }
-
-        Command::ReceiveApplicationMessage { profile } => {
-            let message_bytes = relay_get_application_message(relay_url, &client.name)?;
-            let plaintext = client.receive_application_message(&message_bytes, profile)?;
-            let text = String::from_utf8_lossy(&plaintext).to_string();
-            Ok(format!("application message received: {}", text))
-        }
-
-        Command::SelfUpdate => {
-            let recipients: Vec<String> = client
-                .member_names()?
-                .into_iter()
-                .filter(|member| member != &client.name)
-                .collect();
-            let recipient_pre_key_bundles = fetch_pre_key_bundles(key_repository_url, &recipients)?;
-            let intent = PendingIntent::SelfUpdate {
-                recipient_pre_key_bundles,
-            };
-
-            match try_start_intent(client, key_repository_url, &intent)? {
-                KeyRepositoryPostResult::Ok => Ok(
-                    "self_update pairwise Signal group-control change published to group"
-                        .to_string(),
-                ),
-                KeyRepositoryPostResult::Conflict(message) => {
-                    *queued_intent = Some(intent);
-                    Ok(format!(
-                        "self_update lost the epoch race and was queued for retry: {}",
-                        message
-                    ))
-                }
+            for (recipient, message_bytes) in messages {
+                relay_post_message(relay_url, &recipient, message_bytes)?;
             }
-        }
-
-        Command::RemoveMembers { members } => {
-            let recipients: Vec<String> = client
-                .member_names()?
-                .into_iter()
-                .filter(|member| member != &client.name && !members.contains(member))
-                .collect();
-            let recipient_pre_key_bundles = fetch_pre_key_bundles(key_repository_url, &recipients)?;
-
-            let intent = PendingIntent::RemoveMembers {
-                members: members.clone(),
-                recipient_pre_key_bundles,
-            };
-
-            match try_start_intent(client, key_repository_url, &intent)? {
-                KeyRepositoryPostResult::Ok => Ok(format!(
-                    "Signal members {:?} removed locally; pairwise group-control change published",
-                    members
-                )),
-                KeyRepositoryPostResult::Conflict(message) => {
-                    *queued_intent = Some(intent);
-                    Ok(format!(
-                        "remove_members for {:?} lost the epoch race and was queued for retry: {}",
-                        members, message
-                    ))
-                }
-            }
-        }
-
-        Command::ReceiveGroupChange => {
-            let path = format!("/group-change/{}", client.name);
-            let change_bytes = key_repo_get_bytes(key_repository_url, &path)?;
-
-            match client.receive_commit(&change_bytes)? {
-                CommitReceiveOutcome::ExternalChangeApplied { self_removed } => {
-                    if self_removed {
-                        *queued_intent = None;
-                        Ok("external Signal group change received; this client was removed and local group state was cleared".to_string())
-                    } else {
-                        update_key_repository_group_state(client, key_repository_url)?;
-
-                        let retry_message =
-                            maybe_retry_pending_intent(client, key_repository_url, queued_intent)?;
-
-                        match retry_message {
-                            Some(text) => Ok(format!(
-                                "external Signal group change received and processed; key repository group state updated; {}",
-                                text
-                            )),
-                            None => Ok(
-                                "external Signal group change received and processed; key repository group state updated"
-                                    .to_string(),
-                            ),
-                        }
-                    }
-                }
-
-                CommitReceiveOutcome::OwnChangeAccepted {
-                    self_removed,
-                    group_invites,
-                } => {
-                    if self_removed {
-                        *queued_intent = None;
-                        Ok("own Signal group change accepted from key repository; this client was removed and local group state was cleared".to_string())
-                    } else {
-                        for (recipient, invite) in group_invites {
-                            let invite_path = format!("/group-invite/{recipient}");
-                            key_repo_post_bytes(key_repository_url, &invite_path, invite)?;
-                        }
-
-                        update_key_repository_group_state(client, key_repository_url)?;
-                        Ok("own Signal group change accepted from key repository; local state updated and encrypted group invites published"
-                            .to_string())
-                    }
-                }
-            }
-        }
-
-        Command::ShowGroupState => {
-            let group_id = client.group_id_hex()?;
-            let epoch = client.current_epoch_u64()?;
-            let members = client.member_names()?;
 
             Ok(format!(
-                "group_id={}, epoch={}, members={:?}",
-                group_id, epoch, members
+                "fanout message sent to {} recipients",
+                recipients.len()
             ))
         }
-    }
-}
 
-fn fetch_pre_key_bundles(
-    key_repository_url: &str,
-    members: &[String],
-) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut bundles = Vec::with_capacity(members.len());
-    for member in members {
-        let path = format!("/pre-key-bundle/{member}");
-        bundles.push((
-            member.clone(),
-            key_repo_get_bytes(key_repository_url, &path)?,
-        ));
+        Command::ReceivePairwiseMessage { profile } => {
+            let message_bytes = relay_get_message(relay_url, &client.name)?;
+            let plaintext = client.receive_application_message(&message_bytes, profile)?;
+            let text = String::from_utf8_lossy(&plaintext).to_string();
+            Ok(format!("pairwise message received: {}", text))
+        }
+
+        Command::SessionExists { peer } => Ok(format!(
+            "session_exists peer={} value={}",
+            peer,
+            client.session_exists(&peer)?
+        )),
     }
-    Ok(bundles)
 }

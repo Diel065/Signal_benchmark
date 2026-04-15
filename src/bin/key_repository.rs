@@ -7,26 +7,13 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
-    Json, Router,
+    routing::{get, post},
+    Router,
 };
-use serde::{Deserialize, Serialize};
 
-use signal_playground::key_repository::{GroupInfo, KeyRepository};
+use signal_playground::key_repository::KeyRepository;
 
 type SharedKeyRepository = Arc<Mutex<KeyRepository>>;
-
-#[derive(Debug, Deserialize)]
-struct GroupStatePutRequest {
-    members: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct GroupStateResponse {
-    group_id: String,
-    current_epoch: u64,
-    members: Vec<String>,
-}
 
 fn parse_args() -> Result<SocketAddr> {
     let mut args = std::env::args().skip(1);
@@ -62,17 +49,6 @@ async fn main() -> Result<()> {
             "/pre-key-bundle/{owner}",
             post(publish_pre_key_bundle).get(fetch_pre_key_bundle),
         )
-        .route("/group-change/{recipient}", get(fetch_group_change))
-        .route(
-            "/group-invite/{recipient}",
-            post(publish_group_invite).get(fetch_group_invite),
-        )
-        .route("/group/{group_id}/state/{epoch}", put(put_group_state))
-        .route("/group/{group_id}/state", get(get_group_state))
-        .route(
-            "/group/{group_id}/change/{sender}/{epoch}",
-            post(publish_group_change),
-        )
         .with_state(state);
 
     println!("[KEY-REPO] Listening on http://{}", addr);
@@ -96,113 +72,59 @@ async fn publish_pre_key_bundle(
     State(state): State<SharedKeyRepository>,
     Path(owner): Path<String>,
     body: Bytes,
-) -> StatusCode {
+) -> Response {
     let mut key_repository = state.lock().unwrap();
-    key_repository.publish_pre_key_bundle(&owner, body.to_vec());
-    println!("[KEY-REPO] Stored pre-key bundle for {}", owner);
-    StatusCode::OK
+    match key_repository.publish_pre_key_bundle(&owner, body.to_vec()) {
+        Ok(()) => {
+            println!("[KEY-REPO] Stored pre-key bundle for {}", owner);
+            StatusCode::OK.into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid pre-key bundle for {}: {}", owner, err),
+        )
+            .into_response(),
+    }
 }
 
 async fn fetch_pre_key_bundle(
     State(state): State<SharedKeyRepository>,
     Path(owner): Path<String>,
 ) -> Response {
-    let key_repository = state.lock().unwrap();
+    let mut key_repository = state.lock().unwrap();
     match key_repository.fetch_pre_key_bundle(&owner) {
-        Some(bytes) => bytes_response(bytes),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn put_group_state(
-    State(state): State<SharedKeyRepository>,
-    Path((group_id, epoch)): Path<(String, u64)>,
-    Json(body): Json<GroupStatePutRequest>,
-) -> Response {
-    let mut key_repository = state.lock().unwrap();
-
-    match key_repository.put_group_state(&group_id, epoch, body.members) {
-        Ok(()) => {
+        Ok(Some(outcome)) => {
             println!(
-                "[KEY-REPO] Updated group state for group={} epoch={}",
-                group_id, epoch
+                "[KEY-REPO] Fetched pre-key bundle for {} opk_present={} opk_consumed={} bundle_bytes={}",
+                owner,
+                outcome.opk_present,
+                outcome.opk_consumed,
+                outcome.bytes.len()
             );
-            StatusCode::OK.into_response()
+            bytes_response(outcome.bytes, outcome.opk_present, outcome.opk_consumed)
         }
-        Err(message) => (StatusCode::CONFLICT, message).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not fetch pre-key bundle for {}: {}", owner, err),
+        )
+            .into_response(),
     }
 }
 
-async fn get_group_state(
-    State(state): State<SharedKeyRepository>,
-    Path(group_id): Path<String>,
-) -> Response {
-    let key_repository = state.lock().unwrap();
-    match key_repository.get_group_state(&group_id) {
-        Some(GroupInfo {
-            current_epoch,
-            members,
-        }) => Json(GroupStateResponse {
-            group_id,
-            current_epoch,
-            members,
-        })
-        .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn publish_group_change(
-    State(state): State<SharedKeyRepository>,
-    Path((group_id, sender, epoch)): Path<(String, String, u64)>,
-    body: Bytes,
-) -> Response {
-    let mut key_repository = state.lock().unwrap();
-
-    match key_repository.publish_group_change(&group_id, &sender, epoch, body.to_vec()) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(message) => (StatusCode::CONFLICT, message).into_response(),
-    }
-}
-
-async fn fetch_group_change(
-    State(state): State<SharedKeyRepository>,
-    Path(recipient): Path<String>,
-) -> Response {
-    let mut key_repository = state.lock().unwrap();
-    match key_repository.fetch_group_change(&recipient) {
-        Some(bytes) => bytes_response(bytes),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn publish_group_invite(
-    State(state): State<SharedKeyRepository>,
-    Path(recipient): Path<String>,
-    body: Bytes,
-) -> StatusCode {
-    let mut key_repository = state.lock().unwrap();
-    key_repository.publish_group_invite(&recipient, body.to_vec());
-    println!("[KEY-REPO] Stored encrypted group invite for {}", recipient);
-    StatusCode::OK
-}
-
-async fn fetch_group_invite(
-    State(state): State<SharedKeyRepository>,
-    Path(recipient): Path<String>,
-) -> Response {
-    let mut key_repository = state.lock().unwrap();
-    match key_repository.fetch_group_invite(&recipient) {
-        Some(bytes) => bytes_response(bytes),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-fn bytes_response(bytes: Vec<u8>) -> Response {
+fn bytes_response(bytes: Vec<u8>, opk_present: bool, opk_consumed: bool) -> Response {
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        "x-signal-opk-present",
+        HeaderValue::from_static(if opk_present { "true" } else { "false" }),
+    );
+    response.headers_mut().insert(
+        "x-signal-opk-consumed",
+        HeaderValue::from_static(if opk_consumed { "true" } else { "false" }),
     );
     response
 }

@@ -32,11 +32,11 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     roundtrips: usize,
 
-    /// Base scaling factor before capping: requested updates = update_rounds * N
+    /// Reserved compatibility knob; ignored because vanilla Signal has no shared protocol update op.
     #[arg(long, default_value_t = 2)]
     update_rounds: usize,
 
-    /// Hard cap on successful self-update cycles at each plateau
+    /// Reserved compatibility cap for the ignored shared-update phase.
     #[arg(long, default_value_t = 16)]
     max_update_samples_per_plateau: usize,
 

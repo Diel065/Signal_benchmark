@@ -36,13 +36,6 @@ pub struct WorkerSpec {
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
-struct GroupStateSnapshot {
-    group_id: String,
-    epoch: u64,
-    members: Vec<String>,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 struct ProfileEvent {
     ts_unix_ns: u128,
@@ -52,14 +45,27 @@ struct ProfileEvent {
     cpu_thread_ns: Option<u128>,
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
-    artifact_size_bytes: Option<usize>,
-    encrypted_group_info_bytes: Option<usize>,
-    encrypted_secrets_count: Option<usize>,
-    group_epoch: Option<u64>,
-    tree_size: Option<u32>,
-    member_count: Option<usize>,
-    invitee_count: Option<usize>,
+    success: bool,
+    protocol_bytes: Option<usize>,
+    wire_bytes: Option<usize>,
+    harness_metadata_bytes: Option<usize>,
+    ciphertext_count: Option<usize>,
+    recipient_count: Option<usize>,
+    fanout_recipients: Option<usize>,
+    session_setup_count: Option<usize>,
+    opk_present_count: Option<usize>,
+    opk_consumed_count: Option<usize>,
+    pre_key_bundle_fetch_bytes: Option<usize>,
+    prekey_message_count: Option<usize>,
+    whisper_message_count: Option<usize>,
+    ratchet_message_counter: Option<u32>,
+    out_of_order_messages_seen: Option<usize>,
+    duplicate_messages_seen: Option<usize>,
+    skipped_keys_buffered: Option<usize>,
+    participant_count: Option<usize>,
+    new_participant_count: Option<usize>,
     ciphersuite: Option<String>,
+    payload_class: Option<String>,
     app_msg_plaintext_bytes: Option<usize>,
     app_msg_padding_bytes: Option<usize>,
     app_msg_ciphertext_bytes: Option<usize>,
@@ -194,6 +200,7 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
 
     let total_units = estimate_total_units(
         &plateau_sequence,
+        config.workers.len(),
         config.update_rounds,
         config.app_rounds,
         config.max_update_samples_per_plateau,
@@ -202,10 +209,9 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
     );
 
     eprintln!(
-        "Scenario plan: plateaus={:?}, payload_sizes={:?}, update_cap={}, app_cap={}, total_units≈{}",
+        "Scenario plan: plateaus={:?}, payload_sizes={:?}, shared_protocol_updates=disabled, app_cap={}, total_units≈{}",
         plateau_sequence,
         config.payload_sizes,
-        config.max_update_samples_per_plateau,
         config.max_app_samples_per_payload,
         total_units
     );
@@ -213,17 +219,11 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
     let mut progress = Progress::new(total_units);
     progress.render("starting");
 
-    let leader = config.workers[0].clone();
-    let mut active = vec![leader.clone()];
-    let mut idle: VecDeque<WorkerSpec> = config.workers.iter().skip(1).cloned().collect();
+    publish_pre_key_bundles(&http, &config.workers, &mut progress)?;
 
-    create_group(&http, &leader, &mut progress)?;
-    let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
-    let initial_state = ensure_converged(&http, &active, &active_ids)?;
-    eprintln!(
-        "\nInitial convergence: group_id={}, epoch={}, members={:?}",
-        initial_state.group_id, initial_state.epoch, initial_state.members
-    );
+    // The active set is runner-owned benchmark metadata, not shared protocol state.
+    let mut active = Vec::new();
+    let mut idle: VecDeque<WorkerSpec> = config.workers.iter().cloned().collect();
 
     for (plateau_idx, &target_size) in plateau_sequence.iter().enumerate() {
         eprintln!(
@@ -233,29 +233,19 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
             target_size
         );
 
-        transition_to_size(&http, &mut active, &mut idle, target_size, &mut progress)?;
+        transition_to_size(&mut active, &mut idle, target_size, &mut progress)?;
 
         let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
-        let state = ensure_converged(&http, &active, &active_ids)?;
         eprintln!(
-            "\n[plateau {}] converged at epoch {} with members {:?}",
-            target_size, state.epoch, state.members
+            "\n[plateau {}] active benchmark participants {:?}",
+            target_size, active_ids
         );
 
         run_update_phase(
-            &http,
-            &active,
             target_size,
             config.update_rounds,
             config.max_update_samples_per_plateau,
-            &mut progress,
         )?;
-
-        let state_after_updates = ensure_converged(&http, &active, &active_ids)?;
-        eprintln!(
-            "\n[plateau {}] post-update convergence at epoch {}",
-            target_size, state_after_updates.epoch
-        );
 
         run_application_phase(
             &http,
@@ -385,134 +375,6 @@ fn send_cmd_expect_ok_fragment(
     }
 }
 
-fn send_cmd_until_ok(
-    http: &reqwest::blocking::Client,
-    worker: &WorkerSpec,
-    command: &Command,
-    ok_fragment: &str,
-    retryable_error_fragment: &str,
-    timeout: Duration,
-) -> Result<String> {
-    let start = Instant::now();
-
-    while start.elapsed() < timeout {
-        let response = send_command(http, worker, command)?;
-
-        match response.status.as_str() {
-            "ok" if response.message.contains(ok_fragment) => return Ok(response.message),
-            "ok" => {
-                return Err(anyhow!(
-                    "Worker {} returned unexpected ok message: {}",
-                    worker.id,
-                    response.message
-                ));
-            }
-            "error" if response.message.contains(retryable_error_fragment) => {
-                thread::sleep(Duration::from_millis(500));
-            }
-            "error" => {
-                return Err(anyhow!("Worker {} error: {}", worker.id, response.message));
-            }
-            other => {
-                return Err(anyhow!(
-                    "Worker {} returned unknown status '{}': {}",
-                    worker.id,
-                    other,
-                    response.message
-                ));
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "Timeout waiting for ok fragment '{}' from worker {}",
-        ok_fragment,
-        worker.id
-    ))
-}
-
-fn parse_group_state_message(message: &str) -> Result<GroupStateSnapshot> {
-    let msg = message
-        .strip_prefix("group_id=")
-        .ok_or_else(|| anyhow!("Unexpected show_group_state message: {}", message))?;
-
-    let (group_id, rest) = msg
-        .split_once(", epoch=")
-        .ok_or_else(|| anyhow!("Missing epoch in show_group_state message: {}", message))?;
-
-    let (epoch_str, members_str) = rest
-        .split_once(", members=")
-        .ok_or_else(|| anyhow!("Missing members in show_group_state message: {}", message))?;
-
-    let epoch = epoch_str
-        .parse::<u64>()
-        .with_context(|| format!("Invalid epoch '{}' in '{}'", epoch_str, message))?;
-
-    let mut members: Vec<String> = serde_json::from_str(members_str)
-        .with_context(|| format!("Invalid members list '{}' in '{}'", members_str, message))?;
-
-    members.sort();
-
-    Ok(GroupStateSnapshot {
-        group_id: group_id.to_string(),
-        epoch,
-        members,
-    })
-}
-
-fn show_group_state(
-    http: &reqwest::blocking::Client,
-    worker: &WorkerSpec,
-) -> Result<GroupStateSnapshot> {
-    let message = send_cmd_expect_ok_fragment(http, worker, &Command::ShowGroupState, "group_id=")?;
-    parse_group_state_message(&message)
-}
-
-fn ensure_converged(
-    http: &reqwest::blocking::Client,
-    active_workers: &[WorkerSpec],
-    expected_active_ids: &[String],
-) -> Result<GroupStateSnapshot> {
-    if active_workers.is_empty() {
-        return Err(anyhow!("No active workers to verify"));
-    }
-
-    let mut expected_members = expected_active_ids.to_vec();
-    expected_members.sort();
-
-    let reference = show_group_state(http, &active_workers[0])?;
-
-    if reference.members != expected_members {
-        return Err(anyhow!(
-            "Reference worker {} member list mismatch. Expected {:?}, got {:?}",
-            active_workers[0].id,
-            expected_members,
-            reference.members
-        ));
-    }
-
-    for worker in active_workers.iter().skip(1) {
-        let state = show_group_state(http, worker)?;
-        if state.group_id != reference.group_id
-            || state.epoch != reference.epoch
-            || state.members != reference.members
-        {
-            return Err(anyhow!(
-                "Convergence mismatch on worker {}. Expected group_id={}, epoch={}, members={:?}; got group_id={}, epoch={}, members={:?}",
-                worker.id,
-                reference.group_id,
-                reference.epoch,
-                reference.members,
-                state.group_id,
-                state.epoch,
-                state.members
-            ));
-        }
-    }
-
-    Ok(reference)
-}
-
 fn stepped_sizes(min_size: usize, max_size: usize, step_size: usize) -> Vec<usize> {
     let mut sizes = Vec::new();
     let mut current = min_size;
@@ -563,14 +425,11 @@ fn cap_count(raw: usize, cap: usize) -> usize {
 }
 
 fn update_ops_for_plateau(
-    size: usize,
-    update_rounds: usize,
-    max_update_samples_per_plateau: usize,
+    _size: usize,
+    _update_rounds: usize,
+    _max_update_samples_per_plateau: usize,
 ) -> usize {
-    cap_count(
-        update_rounds.saturating_mul(size),
-        max_update_samples_per_plateau,
-    )
+    0
 }
 
 fn app_sends_per_payload_for_plateau(
@@ -597,14 +456,15 @@ fn app_ops_for_plateau(
 
 fn estimate_total_units(
     plateau_sequence: &[usize],
+    worker_count: usize,
     update_rounds: usize,
     app_rounds: usize,
     max_update_samples_per_plateau: usize,
     max_app_samples_per_payload: usize,
     payload_count: usize,
 ) -> usize {
-    let mut total = 1usize;
-    let mut current_size = 1usize;
+    let mut total = worker_count;
+    let mut current_size = 0usize;
 
     for &target in plateau_sequence {
         total = total.saturating_add(target.abs_diff(current_size));
@@ -649,122 +509,41 @@ fn deterministic_payload(
     out
 }
 
-fn create_group(
+fn publish_pre_key_bundles(
     http: &reqwest::blocking::Client,
-    leader: &WorkerSpec,
+    workers: &[WorkerSpec],
     progress: &mut Progress,
 ) -> Result<()> {
-    let fragment = format!("pre-key bundle uploaded for {}", leader.id);
-    send_cmd_expect_ok_fragment(http, leader, &Command::GeneratePreKeyBundle, &fragment)?;
+    for worker in workers {
+        let fragment = format!("pre-key bundle uploaded for {}", worker.id);
+        send_cmd_expect_ok_fragment(http, worker, &Command::GeneratePreKeyBundle, &fragment)?;
+        progress.tick(&format!("publish pre-key bundle {}", worker.id));
+    }
 
-    send_cmd_expect_ok_fragment(
-        http,
-        leader,
-        &Command::CreateGroup,
-        "Signal group created and key repository group state registered",
-    )?;
-    progress.tick("create_group");
     Ok(())
 }
 
-fn add_one_member(
-    http: &reqwest::blocking::Client,
+fn activate_one_participant(
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
     progress: &mut Progress,
 ) -> Result<()> {
-    let timeout = Duration::from_secs(30);
-    let leader = active
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("No leader in active set"))?;
-
     let joiner = idle
         .pop_front()
         .ok_or_else(|| anyhow!("No idle worker available to add"))?;
 
-    let fragment = format!("pre-key bundle uploaded for {}", joiner.id);
-    send_cmd_expect_ok_fragment(http, &joiner, &Command::GeneratePreKeyBundle, &fragment)?;
-
-    send_cmd_expect_ok_fragment(
-        http,
-        &leader,
-        &Command::AddMembers {
-            members: vec![joiner.id.clone()],
-        },
-        "added locally with pairwise group-control messages",
-    )?;
-
-    send_cmd_expect_ok_fragment(
-        http,
-        &leader,
-        &Command::ReceiveGroupChange,
-        "own Signal group change accepted from key repository",
-    )?;
-
-    let join_fragment = format!("{} joined from Signal group invite", joiner.id);
-    send_cmd_until_ok(
-        http,
-        &joiner,
-        &Command::JoinFromGroupInvite,
-        &join_fragment,
-        "404 Not Found",
-        timeout,
-    )?;
-
-    for other in active.iter().skip(1) {
-        send_cmd_expect_ok_fragment(
-            http,
-            other,
-            &Command::ReceiveGroupChange,
-            "external Signal group change received and processed",
-        )?;
-    }
-
     active.push(joiner.clone());
-    progress.tick(&format!("add {}", joiner.id));
+    progress.tick(&format!("activate {}", joiner.id));
     Ok(())
 }
 
-fn remove_one_member(
-    http: &reqwest::blocking::Client,
+fn deactivate_one_participant(
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
     progress: &mut Progress,
 ) -> Result<()> {
-    if active.len() <= 1 {
-        return Err(anyhow!("Cannot remove the last remaining member"));
-    }
-
-    let leader = active[0].clone();
-    let removed = active
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("No removable worker found"))?;
-
-    send_cmd_expect_ok_fragment(
-        http,
-        &leader,
-        &Command::RemoveMembers {
-            members: vec![removed.id.clone()],
-        },
-        "removed locally; pairwise group-control change published",
-    )?;
-
-    send_cmd_expect_ok_fragment(
-        http,
-        &leader,
-        &Command::ReceiveGroupChange,
-        "own Signal group change accepted from key repository",
-    )?;
-
-    for other in active.iter().skip(1) {
-        send_cmd_expect_ok_fragment(
-            http,
-            other,
-            &Command::ReceiveGroupChange,
-            "external Signal group change received",
-        )?;
+    if active.is_empty() {
+        return Err(anyhow!("No active worker available to deactivate"));
     }
 
     let actually_removed = active
@@ -772,85 +551,42 @@ fn remove_one_member(
         .ok_or_else(|| anyhow!("Active set unexpectedly empty during removal"))?;
     idle.push_front(actually_removed.clone());
 
-    progress.tick(&format!("remove {}", actually_removed.id));
+    progress.tick(&format!("deactivate {}", actually_removed.id));
     Ok(())
 }
 
 fn transition_to_size(
-    http: &reqwest::blocking::Client,
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
     target_size: usize,
     progress: &mut Progress,
 ) -> Result<()> {
     while active.len() < target_size {
-        add_one_member(http, active, idle, progress)?;
+        activate_one_participant(active, idle, progress)?;
     }
 
     while active.len() > target_size {
-        remove_one_member(http, active, idle, progress)?;
+        deactivate_one_participant(active, idle, progress)?;
     }
 
     Ok(())
 }
 
 fn run_update_phase(
-    http: &reqwest::blocking::Client,
-    active: &[WorkerSpec],
     plateau_size: usize,
     update_rounds: usize,
     max_update_samples_per_plateau: usize,
-    progress: &mut Progress,
 ) -> Result<()> {
     let total_updates =
         update_ops_for_plateau(plateau_size, update_rounds, max_update_samples_per_plateau);
     if total_updates == 0 {
-        return Ok(());
-    }
-
-    eprintln!(
-        "\n[plateau {}] update phase: {} successful self-update cycles",
-        plateau_size, total_updates
-    );
-
-    for seq_no in 0..total_updates {
-        let actor_idx = seq_no % active.len();
-        let actor = &active[actor_idx];
-
-        send_cmd_expect_ok_fragment(
-            http,
-            actor,
-            &Command::SelfUpdate,
-            "self_update pairwise Signal group-control change published to group",
-        )?;
-
-        send_cmd_expect_ok_fragment(
-            http,
-            actor,
-            &Command::ReceiveGroupChange,
-            "own Signal group change accepted from key repository",
-        )?;
-
-        for (j, worker) in active.iter().enumerate() {
-            if j == actor_idx {
-                continue;
-            }
-
-            send_cmd_expect_ok_fragment(
-                http,
-                worker,
-                &Command::ReceiveGroupChange,
-                "external Signal group change received and processed",
-            )?;
+        if update_rounds > 0 && max_update_samples_per_plateau > 0 {
+            eprintln!(
+                "\n[plateau {}] shared protocol update phase skipped: vanilla Signal has no group epoch/commit step",
+                plateau_size
+            );
         }
-
-        progress.tick(&format!(
-            "plateau {} update {}/{} actor={}",
-            plateau_size,
-            seq_no + 1,
-            total_updates,
-            actor.id
-        ));
+        return Ok(());
     }
 
     Ok(())
@@ -890,29 +626,90 @@ fn run_application_phase(
             let actor = &active[actor_idx];
             let payload =
                 deterministic_payload(payload_size, plateau_size, payload_size, seq_no, &actor.id);
+            let recipients: Vec<&WorkerSpec> = active
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, worker)| (idx != actor_idx).then_some(worker))
+                .collect();
+            let recipient_ids: Vec<String> =
+                recipients.iter().map(|worker| worker.id.clone()).collect();
 
-            send_cmd_expect_ok_fragment(
+            let send_message = send_cmd_expect_ok_fragment(
                 http,
                 actor,
-                &Command::SendApplicationMessage { message: payload },
-                "pairwise Signal application message broadcast to group",
+                &Command::SendFanoutMessage {
+                    recipients: recipient_ids.clone(),
+                    message: payload.clone(),
+                },
+                "fanout message sent to",
             )?;
+            let expected_send_message =
+                format!("fanout message sent to {} recipients", recipient_ids.len());
+            if send_message != expected_send_message {
+                return Err(anyhow!(
+                    "Worker {} returned unexpected send confirmation: {}",
+                    actor.id,
+                    send_message
+                ));
+            }
 
-            let recipient_indices: Vec<usize> =
-                (0..active.len()).filter(|&j| j != actor_idx).collect();
+            for recipient_id in &recipient_ids {
+                let session_message = send_cmd_expect_ok_fragment(
+                    http,
+                    actor,
+                    &Command::SessionExists {
+                        peer: recipient_id.clone(),
+                    },
+                    "session_exists",
+                )?;
+                let expected_session_message =
+                    format!("session_exists peer={} value=true", recipient_id);
+                if session_message != expected_session_message {
+                    return Err(anyhow!(
+                        "Worker {} session check failed after send: {}",
+                        actor.id,
+                        session_message
+                    ));
+                }
+            }
 
-            let sampled_pos = seq_no % recipient_indices.len();
+            let sampled_pos = seq_no % recipients.len();
 
-            for (pos, recipient_idx) in recipient_indices.iter().enumerate() {
-                let worker = &active[*recipient_idx];
+            for (pos, worker) in recipients.iter().enumerate() {
                 let profile = pos == sampled_pos;
 
-                send_cmd_expect_ok_fragment(
+                let receive_message = send_cmd_expect_ok_fragment(
                     http,
                     worker,
-                    &Command::ReceiveApplicationMessage { profile },
-                    "application message received:",
+                    &Command::ReceivePairwiseMessage { profile },
+                    "pairwise message received:",
                 )?;
+                let expected_receive_message = format!("pairwise message received: {}", payload);
+                if receive_message != expected_receive_message {
+                    return Err(anyhow!(
+                        "Worker {} decrypted unexpected plaintext: {}",
+                        worker.id,
+                        receive_message
+                    ));
+                }
+
+                let session_message = send_cmd_expect_ok_fragment(
+                    http,
+                    worker,
+                    &Command::SessionExists {
+                        peer: actor.id.clone(),
+                    },
+                    "session_exists",
+                )?;
+                let expected_session_message =
+                    format!("session_exists peer={} value=true", actor.id);
+                if session_message != expected_session_message {
+                    return Err(anyhow!(
+                        "Worker {} session check failed after receive: {}",
+                        worker.id,
+                        session_message
+                    ));
+                }
             }
 
             progress.tick(&format!(
@@ -943,14 +740,27 @@ fn aggregate_csv(run_dir: &Path, worker_ids: &[String]) -> Result<()> {
         cpu_thread_ns: Option<u128>,
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
-        artifact_size_bytes: Option<usize>,
-        encrypted_group_info_bytes: Option<usize>,
-        encrypted_secrets_count: Option<usize>,
-        group_epoch: Option<u64>,
-        tree_size: Option<u32>,
-        member_count: Option<usize>,
-        invitee_count: Option<usize>,
+        success: bool,
+        protocol_bytes: Option<usize>,
+        wire_bytes: Option<usize>,
+        harness_metadata_bytes: Option<usize>,
+        ciphertext_count: Option<usize>,
+        recipient_count: Option<usize>,
+        fanout_recipients: Option<usize>,
+        session_setup_count: Option<usize>,
+        opk_present_count: Option<usize>,
+        opk_consumed_count: Option<usize>,
+        pre_key_bundle_fetch_bytes: Option<usize>,
+        prekey_message_count: Option<usize>,
+        whisper_message_count: Option<usize>,
+        ratchet_message_counter: Option<u32>,
+        out_of_order_messages_seen: Option<usize>,
+        duplicate_messages_seen: Option<usize>,
+        skipped_keys_buffered: Option<usize>,
+        participant_count: Option<usize>,
+        new_participant_count: Option<usize>,
         ciphersuite: Option<String>,
+        payload_class: Option<String>,
         app_msg_plaintext_bytes: Option<usize>,
         app_msg_padding_bytes: Option<usize>,
         app_msg_ciphertext_bytes: Option<usize>,
@@ -990,14 +800,27 @@ fn aggregate_csv(run_dir: &Path, worker_ids: &[String]) -> Result<()> {
                 cpu_thread_ns: event.cpu_thread_ns,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
-                artifact_size_bytes: event.artifact_size_bytes,
-                encrypted_group_info_bytes: event.encrypted_group_info_bytes,
-                encrypted_secrets_count: event.encrypted_secrets_count,
-                group_epoch: event.group_epoch,
-                tree_size: event.tree_size,
-                member_count: event.member_count,
-                invitee_count: event.invitee_count,
+                success: event.success,
+                protocol_bytes: event.protocol_bytes,
+                wire_bytes: event.wire_bytes,
+                harness_metadata_bytes: event.harness_metadata_bytes,
+                ciphertext_count: event.ciphertext_count,
+                recipient_count: event.recipient_count,
+                fanout_recipients: event.fanout_recipients,
+                session_setup_count: event.session_setup_count,
+                opk_present_count: event.opk_present_count,
+                opk_consumed_count: event.opk_consumed_count,
+                pre_key_bundle_fetch_bytes: event.pre_key_bundle_fetch_bytes,
+                prekey_message_count: event.prekey_message_count,
+                whisper_message_count: event.whisper_message_count,
+                ratchet_message_counter: event.ratchet_message_counter,
+                out_of_order_messages_seen: event.out_of_order_messages_seen,
+                duplicate_messages_seen: event.duplicate_messages_seen,
+                skipped_keys_buffered: event.skipped_keys_buffered,
+                participant_count: event.participant_count,
+                new_participant_count: event.new_participant_count,
                 ciphersuite: event.ciphersuite,
+                payload_class: event.payload_class,
                 app_msg_plaintext_bytes: event.app_msg_plaintext_bytes,
                 app_msg_padding_bytes: event.app_msg_padding_bytes,
                 app_msg_ciphertext_bytes: event.app_msg_ciphertext_bytes,
@@ -1015,6 +838,9 @@ fn aggregate_csv(run_dir: &Path, worker_ids: &[String]) -> Result<()> {
     }
 
     wtr.flush()?;
+    eprintln!(
+        "CSV columns: worker_id, ts_unix_ns, op, implementation, wall_ns, cpu_thread_ns, alloc_bytes, alloc_count, success, protocol_bytes, wire_bytes, harness_metadata_bytes, ciphertext_count, recipient_count, fanout_recipients, session_setup_count, opk_present_count, opk_consumed_count, pre_key_bundle_fetch_bytes, prekey_message_count, whisper_message_count, ratchet_message_counter, out_of_order_messages_seen, duplicate_messages_seen, skipped_keys_buffered, participant_count, new_participant_count, ciphersuite, payload_class, app_msg_plaintext_bytes, app_msg_padding_bytes, app_msg_ciphertext_bytes, aad_bytes, pid, thread_id, run_id, scenario, node_name, pod_name"
+    );
     Ok(())
 }
 

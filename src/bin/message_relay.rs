@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -46,12 +46,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route(
-            "/group/{group_id}/application-message/{sender}",
-            post(publish_group_application_message),
-        )
-        .route(
-            "/application-message/{recipient}",
-            get(fetch_application_message),
+            "/message/{recipient}",
+            post(publish_message).get(fetch_message),
         )
         .with_state(state);
 
@@ -72,65 +68,26 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn publish_group_application_message(
+async fn publish_message(
     State(state): State<SharedRelay>,
-    Path((group_id, sender)): Path<(String, String)>,
-    headers: HeaderMap,
+    Path(recipient): Path<String>,
     body: Bytes,
-) -> Response {
-    let recipients_header = match headers.get("x-recipients") {
-        Some(value) => value,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Missing required x-recipients header",
-            )
-                .into_response()
-        }
-    };
-
-    let recipients = match parse_recipients_header(recipients_header) {
-        Ok(recipients) => recipients,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-
+) -> StatusCode {
     let mut relay = state.lock().unwrap();
-
-    match relay.publish_group_application_message(&group_id, &sender, &recipients, body.to_vec()) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
-    }
+    relay.publish_message(&recipient, body.to_vec());
+    StatusCode::OK
 }
 
-async fn fetch_application_message(
+async fn fetch_message(
     State(state): State<SharedRelay>,
     Path(recipient): Path<String>,
 ) -> Response {
     let mut relay = state.lock().unwrap();
 
-    match relay.fetch_application_message(&recipient) {
+    match relay.fetch_message(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-fn parse_recipients_header(value: &HeaderValue) -> Result<Vec<String>, String> {
-    let raw = value
-        .to_str()
-        .map_err(|_| "x-recipients header is not valid UTF-8".to_string())?;
-
-    let recipients: Vec<String> = raw
-        .split(',')
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_string())
-        .collect();
-
-    if recipients.is_empty() {
-        return Err("x-recipients header did not contain any recipients".to_string());
-    }
-
-    Ok(recipients)
 }
 
 fn bytes_response(bytes: Vec<u8>) -> Response {

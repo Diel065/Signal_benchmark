@@ -1,6 +1,7 @@
 pub mod client;
 pub mod debug;
 pub mod key_repository;
+pub mod libsignal_pairwise;
 pub mod profiling;
 pub mod worker_api;
 

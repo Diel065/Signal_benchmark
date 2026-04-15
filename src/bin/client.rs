@@ -3,7 +3,7 @@ use std::io::{self, BufRead};
 use anyhow::{anyhow, Result};
 
 use signal_playground::client::Client;
-use signal_playground::worker_api::{handle_command, Command, CommandResponse, PendingIntent};
+use signal_playground::worker_api::{handle_command, Command, CommandResponse};
 
 fn parse_args() -> Result<(String, String, String)> {
     let mut args = std::env::args().skip(1);
@@ -53,7 +53,6 @@ fn main() -> Result<()> {
     let (name, key_repository_url, relay_url) = parse_args()?;
 
     let mut client = Client::new(&name)?;
-    let mut queued_intent: Option<PendingIntent> = None;
 
     eprintln!(
         "[CLIENT {}] started, KEY_REPOSITORY={}, RELAY={}",
@@ -82,13 +81,7 @@ fn main() -> Result<()> {
             }
         };
 
-        match handle_command(
-            &mut client,
-            &key_repository_url,
-            &relay_url,
-            &mut queued_intent,
-            command,
-        ) {
+        match handle_command(&mut client, &key_repository_url, &relay_url, command) {
             Ok(message) => print_response_ok(&message),
             Err(err) => print_response_error(&err.to_string()),
         }
